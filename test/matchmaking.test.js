@@ -71,6 +71,8 @@ function join(client, name, mode, carClass, extra = {}) {
         carClass,
         mode,
         carStats: { topSpeed: 60, accel: 12, steering: 7 },
+        playerLevel: 17,
+        flag: 'pk',
         distance: 5000,
         entryFee: 5000,
         ...extra
@@ -96,6 +98,8 @@ test('two players in the same mode are matched with each other', async () => {
     assert.strictEqual(ma.mode, 'HARD');
     assert.strictEqual(ma.opponent.name, 'Bilal');
     assert.strictEqual(ma.opponent.carClass, 'SSS');
+    assert.strictEqual(ma.opponent.level, 17);
+    assert.strictEqual(ma.opponent.flag, 'pk');
     assert.strictEqual(mb.opponent.name, 'Ali');
     assert.notStrictEqual(ma.role, mb.role);
     a.close(); b.close();

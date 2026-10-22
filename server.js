@@ -232,7 +232,9 @@ function createMatch(p1, p2) {
             carIndex: p2.carIndex,
             carName: p2.carName,
             carClass: p2.carClass,
-            carStats: p2.carStats
+            carStats: p2.carStats,
+            level: p2.level,
+            flag: p2.flag
         }
     });
 
@@ -252,7 +254,9 @@ function createMatch(p1, p2) {
             carIndex: p1.carIndex,
             carName: p1.carName,
             carClass: p1.carClass,
-            carStats: p1.carStats
+            carStats: p1.carStats,
+            level: p1.level,
+            flag: p1.flag
         }
     });
 
@@ -368,6 +372,8 @@ function handleClientMessage(ws, data) {
             carName: data.carName || 'Racer',
             carClass: carClass,
             carStats: data.carStats || { topSpeed: 35, accel: 10, steering: 7 },
+            level: Math.max(1, parseInt(data.playerLevel, 10) || 1),
+            flag: typeof data.flag === 'string' ? data.flag.slice(0, 8).toLowerCase() : '',
             mode: mode,
             queueKey: mode ? 'mode:' + mode : 'legacy:' + distance + '|' + entryFee,
             distance: distance,
@@ -466,7 +472,7 @@ function handleClientMessage(ws, data) {
 
         // Anti-Cheat: Max Speed Bounding
         const maxStatSpeed = (p.carStats && p.carStats.topSpeed) ? p.carStats.topSpeed : 40;
-        const maxAllowedSpeed = maxStatSpeed * 1.5; // allowance for nitro + downhill
+        const maxAllowedSpeed = maxStatSpeed * 2.0; // allowance for fully upgraded nitro (up to 1.9x) + downhill
 
         let reportedSpeed = data.speed || 0;
         if (reportedSpeed > maxAllowedSpeed) {
