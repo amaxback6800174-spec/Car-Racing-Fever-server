@@ -2,15 +2,31 @@ const WebSocket = require('ws');
 const http = require('http');
 
 const PORT = process.env.PORT || 3000;
+// How long both racers have to load the race scene and send ready_for_countdown before the match is called off
+const READY_TIMEOUT_MS = parseInt(process.env.READY_TIMEOUT_MS || '45000', 10);
+
+// 1 VS 1 modes: players only ever meet someone from the same mode, and the car they bring must belong to that mode's classes
+const MODES = {
+    EASY:   { classes: ['B', 'C', 'D', 'E'] },
+    MEDIUM: { classes: ['A'] },
+    HARD:   { classes: ['S', 'SSS', 'S+'] }
+};
+
 const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'online', service: 'CarGame Multiplayer Server', activeRooms: rooms.size }));
+    res.end(JSON.stringify({
+        status: 'online',
+        service: 'CarGame Multiplayer Server',
+        playersOnline: wss.clients.size,
+        searching: matchmakingQueue.length,
+        activeRooms: rooms.size
+    }));
 });
 
 const wss = new WebSocket.Server({ server });
 
 // In-Memory Storage
-const matchmakingQueue = []; // { socket, playerId, playerName, carIndex, carStats, carTier, distance, entryFee, queuedAt }
+const matchmakingQueue = []; // { socket, playerId, playerName, carIndex, carName, carClass, carStats, mode, queueKey, distance, entryFee, queuedAt }
 const rooms = new Map();     // roomId -> RoomObject
 const disconnectedSessions = new Map(); // playerId -> { roomId, opponentId, disconnectTimestamp, timer }
 const playerCareerStats = new Map();    // playerId -> { id, name, carName, wins, losses, matches: [] }
@@ -77,6 +93,7 @@ function recordMatchStats(winner, loser, winnerTime, loserTime, distance, prizeC
 class Room {
     constructor(id, p1, p2, distance, entryFee) {
         this.id = id;
+        this.mode = p1.mode || '';
         this.distance = distance; // 2000, 5000, 10000
         this.entryFee = entryFee;
         this.totalPool = entryFee * 2;
@@ -122,6 +139,10 @@ class Room {
             }
         };
 
+        // Each player keeps the extra profile fields so the opponent card can show them
+        this.players[p1.playerId].carClass = p1.carClass;
+        this.players[p2.playerId].carClass = p2.carClass;
+
         p1.socket.roomId = this.id;
         p2.socket.roomId = this.id;
         p1.socket.playerId = p1.playerId;
@@ -153,19 +174,9 @@ class Room {
     }
 }
 
-// Helper: Calculate car tier based on speed/accel
-function calculateCarTier(stats) {
-    const topSpeed = stats && stats.topSpeed ? stats.topSpeed : 35;
-    if (topSpeed <= 40) return 1;       // Starter Cars
-    if (topSpeed <= 80) return 2;       // Tuned / Muscle
-    return 3;                           // Supercars / Hypercars
-}
-
-// Matchmaking Processor
+// Matchmaking Processor: first come, first served inside each mode queue
 function processMatchmaking() {
     if (matchmakingQueue.length < 2) return;
-
-    const now = Date.now();
 
     for (let i = 0; i < matchmakingQueue.length; i++) {
         const p1 = matchmakingQueue[i];
@@ -175,10 +186,6 @@ function processMatchmaking() {
             continue;
         }
 
-        const waitDurationSec = (now - p1.queuedAt) / 1000;
-        // Fair matching: initially match same tier. After 12s, allow +/- 1 tier. After 25s, allow any tier.
-        const tierTolerance = waitDurationSec > 25 ? 2 : (waitDurationSec > 12 ? 1 : 0);
-
         for (let j = i + 1; j < matchmakingQueue.length; j++) {
             const p2 = matchmakingQueue[j];
             if (!p2.socket || p2.socket.readyState !== WebSocket.OPEN) {
@@ -187,18 +194,14 @@ function processMatchmaking() {
                 continue;
             }
 
-            // Must match same race distance and entry fee
-            if (p1.distance === p2.distance && p1.entryFee === p2.entryFee) {
-                const tierDiff = Math.abs(p1.carTier - p2.carTier);
-                if (tierDiff <= tierTolerance) {
-                    // Match Found!
-                    matchmakingQueue.splice(j, 1);
-                    matchmakingQueue.splice(i, 1);
-                    i--;
+            // Same mode (or same distance + fee for old clients), and never the same player twice
+            if (p1.queueKey === p2.queueKey && p1.playerId !== p2.playerId && p1.socket !== p2.socket) {
+                matchmakingQueue.splice(j, 1);
+                matchmakingQueue.splice(i, 1);
+                i--;
 
-                    createMatch(p1, p2);
-                    break;
-                }
+                createMatch(p1, p2);
+                break;
             }
         }
     }
@@ -219,6 +222,7 @@ function createMatch(p1, p2) {
         roomId: roomId,
         role: 'player1',
         gridStartX: -1.3,
+        mode: room.mode,
         distance: room.distance,
         entryFee: room.entryFee,
         totalPool: room.totalPool,
@@ -227,6 +231,7 @@ function createMatch(p1, p2) {
             name: p2.playerName,
             carIndex: p2.carIndex,
             carName: p2.carName,
+            carClass: p2.carClass,
             carStats: p2.carStats
         }
     });
@@ -237,6 +242,7 @@ function createMatch(p1, p2) {
         roomId: roomId,
         role: 'player2',
         gridStartX: 1.3,
+        mode: room.mode,
         distance: room.distance,
         entryFee: room.entryFee,
         totalPool: room.totalPool,
@@ -245,9 +251,34 @@ function createMatch(p1, p2) {
             name: p1.playerName,
             carIndex: p1.carIndex,
             carName: p1.carName,
+            carClass: p1.carClass,
             carStats: p1.carStats
         }
     });
+
+    // If either phone never reaches the race scene, free the other one instead of leaving it waiting forever
+    room.readyTimer = setTimeout(() => {
+        if (room.state === 'MATCHED') cancelRoom(room, null, 'ready_timeout');
+    }, READY_TIMEOUT_MS);
+}
+
+// Calls off a match that has not started racing yet. Nobody wins or loses; the remaining player is told to search again.
+function cancelRoom(room, leaverId, reason) {
+    if (!room || room.state === 'RACING' || room.state === 'FINISHED' || room.state === 'CANCELLED') return false;
+
+    room.state = 'CANCELLED';
+    if (room.readyTimer) clearTimeout(room.readyTimer);
+    console.log(`[MATCH] Room ${room.id} cancelled before start: ${reason}`);
+
+    for (const pid in room.players) {
+        const p = room.players[pid];
+        if (p.socket && p.socket.roomId === room.id) p.socket.roomId = null;
+        if (pid !== leaverId) {
+            room.sendTo(pid, { type: 'match_cancelled', roomId: room.id, reason: reason });
+        }
+    }
+    rooms.delete(room.id);
+    return true;
 }
 
 // WebSocket Connection Handling
@@ -273,6 +304,7 @@ wss.on('connection', (ws) => {
     // Send initial handshake
     ws.send(JSON.stringify({
         type: 'connected',
+        id: ws.playerId,
         playerId: ws.playerId,
         serverTime: Date.now()
     }));
@@ -293,21 +325,53 @@ function handleClientMessage(ws, data) {
 
     // Join Matchmaking Queue
     if (type === 'join_matchmaking') {
+        // Searching again while still attached to an unstarted match means the player backed out of it
+        if (ws.roomId) {
+            const oldRoom = rooms.get(ws.roomId);
+            if (oldRoom && (oldRoom.state === 'MATCHED' || oldRoom.state === 'COUNTDOWN')) {
+                cancelRoom(oldRoom, ws.playerId, 'opponent_left');
+            } else if (oldRoom && oldRoom.state === 'RACING') {
+                handlePlayerForfeit(oldRoom, ws.playerId, 'Player Left Race');
+            }
+            ws.roomId = null;
+        }
+
+        const mode = typeof data.mode === 'string' ? data.mode.trim().toUpperCase() : '';
+        const carClass = typeof data.carClass === 'string' ? data.carClass.trim().toUpperCase() : '';
+
+        if (mode && !MODES[mode]) {
+            ws.send(JSON.stringify({ type: 'queue_rejected', reason: 'unknown_mode', mode: mode }));
+            return;
+        }
+        if (mode && MODES[mode].classes.indexOf(carClass) === -1) {
+            ws.send(JSON.stringify({
+                type: 'queue_rejected',
+                reason: 'car_class_not_allowed',
+                mode: mode,
+                carClass: carClass,
+                allowedClasses: MODES[mode].classes
+            }));
+            return;
+        }
+
         // Remove existing queue entry if any
-        const existingIdx = matchmakingQueue.findIndex(q => q.playerId === ws.playerId);
+        const existingIdx = matchmakingQueue.findIndex(q => q.socket === ws || q.playerId === ws.playerId);
         if (existingIdx !== -1) matchmakingQueue.splice(existingIdx, 1);
 
-        const carTier = calculateCarTier(data.carStats);
+        const distance = data.distance || 2000;
+        const entryFee = data.entryFee || 500;
         const queueEntry = {
             socket: ws,
             playerId: data.playerId || ws.playerId,
             playerName: data.playerName || 'Player',
             carIndex: data.carIndex || 0,
             carName: data.carName || 'Racer',
+            carClass: carClass,
             carStats: data.carStats || { topSpeed: 35, accel: 10, steering: 7 },
-            carTier: carTier,
-            distance: data.distance || 2000,
-            entryFee: data.entryFee || 500,
+            mode: mode,
+            queueKey: mode ? 'mode:' + mode : 'legacy:' + distance + '|' + entryFee,
+            distance: distance,
+            entryFee: entryFee,
             queuedAt: Date.now()
         };
 
@@ -316,12 +380,14 @@ function handleClientMessage(ws, data) {
 
         ws.send(JSON.stringify({
             type: 'queue_joined',
+            mode: mode,
             distance: queueEntry.distance,
             entryFee: queueEntry.entryFee,
-            carTier: carTier
+            playersOnline: wss.clients.size,
+            searchingInMode: matchmakingQueue.filter(q => q.queueKey === queueEntry.queueKey).length
         }));
 
-        console.log(`[QUEUE] ${queueEntry.playerName} (${queueEntry.playerId}) joined queue. Distance: ${queueEntry.distance}m, Fee: ${queueEntry.entryFee}`);
+        console.log(`[QUEUE] ${queueEntry.playerName} (${queueEntry.playerId}) joined ${mode || 'legacy'} queue with ${queueEntry.carName} [${carClass || '?'}]. Distance: ${queueEntry.distance}m, Fee: ${queueEntry.entryFee}`);
         processMatchmaking();
         return;
     }
@@ -371,6 +437,7 @@ function handleClientMessage(ws, data) {
         const allReady = Object.values(room.players).every(pl => pl.ready);
         if (allReady && room.state === 'MATCHED') {
             room.state = 'COUNTDOWN';
+            if (room.readyTimer) clearTimeout(room.readyTimer);
             const countdownStartTime = Date.now() + 500; // 500ms sync buffer
             room.raceStartTime = countdownStartTime + 3000; // 3-second countdown
 
@@ -525,7 +592,12 @@ function handleClientMessage(ws, data) {
 
     // Explicit Leave Race
     if (type === 'leave_race') {
-        handlePlayerForfeit(room, ws.playerId, 'Player Left Race');
+        if (room.state === 'MATCHED' || room.state === 'COUNTDOWN') {
+            cancelRoom(room, ws.playerId, 'opponent_left');
+            ws.roomId = null;
+        } else {
+            handlePlayerForfeit(room, ws.playerId, 'Player Left Race');
+        }
         return;
     }
 }
@@ -586,7 +658,10 @@ function handleClientDisconnect(ws) {
     // 2. If in active room
     if (ws.roomId) {
         const room = rooms.get(ws.roomId);
-        if (room && room.state === 'RACING') {
+        if (room && (room.state === 'MATCHED' || room.state === 'COUNTDOWN')) {
+            // Left during VS / loading: the other racer goes back to searching instead of waiting forever
+            cancelRoom(room, ws.playerId, 'opponent_left');
+        } else if (room && room.state === 'RACING') {
             const opponent = room.getOpponent(ws.playerId);
             const player = room.players[ws.playerId];
             if (player) player.isDisconnected = true;
@@ -628,7 +703,7 @@ server.listen(PORT, () => {
     console.log(`=======================================================`);
     console.log(`  CarGame Authoritative Multiplayer Server Online!`);
     console.log(`  Port: ${PORT} (WebSocket: ws://localhost:${PORT})`);
-    console.log(`  Matchmaking Distances: 2KM, 5KM, 10KM`);
-    console.log(`  Entry Coin Tiers: 500, 1000, 2500, 5000, 10000`);
+    console.log(`  1v1 Modes: EASY (B/C/D/E), MEDIUM (A), HARD (S/SSS/S+)`);
+    console.log(`  Ready timeout: ${READY_TIMEOUT_MS / 1000}s`);
     console.log(`=======================================================`);
 });

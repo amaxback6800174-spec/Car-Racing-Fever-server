@@ -1,0 +1,9 @@
+# One-click deploy on Render (New > Blueprint > pick this repo)
+services:
+  - type: web
+    name: car-racing-fever-server
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
