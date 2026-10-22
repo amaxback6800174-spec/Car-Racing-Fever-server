@@ -1,0 +1,13 @@
+{
+  "name": "cargame-multiplayer-server",
+  "version": "1.0.0",
+  "description": "Real-time Authoritative 1v1 Multiplayer Server for Android 3D Car Racing Game",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test_simulation.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
